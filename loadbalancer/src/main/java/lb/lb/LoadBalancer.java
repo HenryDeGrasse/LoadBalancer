@@ -7,9 +7,11 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
@@ -27,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Milestone 1: naive L7 reverse proxy doing round-robin.
  * Milestone 2: add active + passive health checking to avoid routing to dead upstreams.
+ * Milestone 3: smarter retry rules (e.g. retry non-idempotent requests on *connect* failures).
  */
 public final class LoadBalancer {
 
@@ -41,10 +44,44 @@ public final class LoadBalancer {
             "upgrade"
     );
 
-    // Health check behavior (Milestone 2)
-    private static final Duration HEALTH_TIMEOUT = Duration.ofMillis(200);
-    private static final Duration HEALTH_PERIOD = Duration.ofMillis(200);
-    private static final Duration PASSIVE_UNHEALTHY_COOLDOWN = Duration.ofSeconds(1);
+    /**
+     * Runtime knobs so tests (and later milestones) can control behavior.
+     */
+    public static final class Options {
+        public final boolean enableActiveHealthChecks;
+        public final Duration healthTimeout;
+        public final Duration healthPeriod;
+        public final Duration passiveUnhealthyCooldown;
+        public final Duration upstreamTimeout;
+
+        public Options() {
+            this(true);
+        }
+
+        public Options(boolean enableActiveHealthChecks) {
+            this(
+                    enableActiveHealthChecks,
+                    Duration.ofMillis(200),
+                    Duration.ofMillis(200),
+                    Duration.ofSeconds(1),
+                    Duration.ofSeconds(10)
+            );
+        }
+
+        public Options(
+                boolean enableActiveHealthChecks,
+                Duration healthTimeout,
+                Duration healthPeriod,
+                Duration passiveUnhealthyCooldown,
+                Duration upstreamTimeout
+        ) {
+            this.enableActiveHealthChecks = enableActiveHealthChecks;
+            this.healthTimeout = Objects.requireNonNull(healthTimeout, "healthTimeout");
+            this.healthPeriod = Objects.requireNonNull(healthPeriod, "healthPeriod");
+            this.passiveUnhealthyCooldown = Objects.requireNonNull(passiveUnhealthyCooldown, "passiveUnhealthyCooldown");
+            this.upstreamTimeout = Objects.requireNonNull(upstreamTimeout, "upstreamTimeout");
+        }
+    }
 
     /**
      * Start the load balancer.
@@ -52,7 +89,17 @@ public final class LoadBalancer {
      * @param listenPort 0 to bind to an ephemeral port.
      */
     public static HttpServer start(int listenPort, List<URI> backends) throws IOException {
+        return start(listenPort, backends, new Options());
+    }
+
+    /**
+     * Start the load balancer.
+     *
+     * @param listenPort 0 to bind to an ephemeral port.
+     */
+    public static HttpServer start(int listenPort, List<URI> backends, Options options) throws IOException {
         Objects.requireNonNull(backends, "backends");
+        Objects.requireNonNull(options, "options");
         if (backends.isEmpty()) throw new IllegalArgumentException("backends must not be empty");
 
         // Proxy client
@@ -63,11 +110,11 @@ public final class LoadBalancer {
 
         // Health check client (keep it separate so we can tune timeouts independently)
         HttpClient healthClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofMillis(200))
+                .connectTimeout(options.healthTimeout)
                 .version(HttpClient.Version.HTTP_1_1)
                 .build();
 
-        BackendPool pool = new BackendPool(backends);
+        BackendPool pool = new BackendPool(backends, options);
 
         HttpServer server = HttpServer.create(new InetSocketAddress("0.0.0.0", listenPort), 0);
         server.setExecutor(Executors.newFixedThreadPool(
@@ -76,23 +123,22 @@ public final class LoadBalancer {
         ));
 
         // Active health checks run in the background.
-        ScheduledExecutorService healthExec = Executors.newSingleThreadScheduledExecutor(new NamedDaemonThreadFactory("lb-health-"));
-        healthExec.scheduleAtFixedRate(() -> {
-            try {
-                pool.runActiveHealthChecks(healthClient);
-            } catch (Exception ignored) {
-                // keep health loop alive
-            }
-        }, 0, HEALTH_PERIOD.toMillis(), TimeUnit.MILLISECONDS);
+        if (options.enableActiveHealthChecks) {
+            ScheduledExecutorService healthExec = Executors.newSingleThreadScheduledExecutor(new NamedDaemonThreadFactory("lb-health-"));
+            healthExec.scheduleAtFixedRate(() -> {
+                try {
+                    pool.runActiveHealthChecks(healthClient);
+                } catch (Exception ignored) {
+                    // keep health loop alive
+                }
+            }, 0, options.healthPeriod.toMillis(), TimeUnit.MILLISECONDS);
+        }
 
         server.createContext("/", exchange -> {
             byte[] requestBody = readAllBytes(exchange.getRequestBody());
             String method = exchange.getRequestMethod();
 
-            // Retry logic is part of "passive" health: if an upstream errors, mark it unhealthy and try another.
-            // For now we only retry safe/idempotent methods.
             int maxAttempts = pool.size();
-            boolean canRetry = isIdempotent(method);
 
             Exception lastError = null;
             URI lastBackend = null;
@@ -106,14 +152,14 @@ public final class LoadBalancer {
 
                 lastBackend = backend;
                 try {
-                    proxy(exchange, backend, proxyClient, requestBody);
+                    proxy(exchange, backend, proxyClient, requestBody, options.upstreamTimeout);
                     return;
                 } catch (Exception e) {
                     lastError = e;
                     pool.markPassiveFailure(backend);
 
-                    // If we can't retry, or we're out of attempts, report error.
-                    if (!canRetry || attempt == maxAttempts) {
+                    boolean retryable = shouldRetry(method, e);
+                    if (!retryable || attempt == maxAttempts) {
                         String msg = "upstream_error=" + e.getClass().getSimpleName() + " message=" + e.getMessage() + "\n";
                         respondText(exchange, 502, msg);
                         return;
@@ -143,11 +189,12 @@ public final class LoadBalancer {
         start(listenPort, backends);
     }
 
-    private static void proxy(HttpExchange exchange, URI backend, HttpClient client, byte[] requestBody) throws IOException, InterruptedException {
+    private static void proxy(HttpExchange exchange, URI backend, HttpClient client, byte[] requestBody, Duration upstreamTimeout)
+            throws IOException, InterruptedException {
         URI target = backend.resolve(exchange.getRequestURI().toString());
 
         HttpRequest.Builder req = HttpRequest.newBuilder(target)
-                .timeout(Duration.ofSeconds(10))
+                .timeout(upstreamTimeout)
                 .method(exchange.getRequestMethod(), requestBody.length == 0
                         ? HttpRequest.BodyPublishers.noBody()
                         : HttpRequest.BodyPublishers.ofByteArray(requestBody));
@@ -177,6 +224,7 @@ public final class LoadBalancer {
             String key = k.toLowerCase();
             if (HOP_BY_HOP.contains(key)) return;
             if ("host".equals(key)) return;
+            if ("content-length".equals(key)) return; // HttpClient sets this; manually setting is rejected.
 
             // java.net.http.HttpClient restricts some headers (Host, Connection, Content-Length, etc.).
             for (String v : values) {
@@ -210,8 +258,27 @@ public final class LoadBalancer {
         return in.readAllBytes();
     }
 
+    private static boolean shouldRetry(String method, Exception e) {
+        // Baseline: retry idempotent methods.
+        if (isIdempotent(method)) return true;
+
+        // Milestone 3: retry *non-idempotent* methods only for failures that strongly suggest
+        // the request did not reach the application (connect failures).
+        return isConnectFailure(e);
+    }
+
     private static boolean isIdempotent(String method) {
         return "GET".equals(method) || "HEAD".equals(method) || "OPTIONS".equals(method);
+    }
+
+    private static boolean isConnectFailure(Throwable t) {
+        Throwable cur = t;
+        while (cur != null) {
+            if (cur instanceof ConnectException) return true;
+            if (cur instanceof HttpConnectTimeoutException) return true;
+            cur = cur.getCause();
+        }
+        return false;
     }
 
     private static List<URI> parseBackends(String csv) {
@@ -257,9 +324,11 @@ public final class LoadBalancer {
     private static final class BackendPool {
         private final List<Backend> backends;
         private final AtomicInteger rr = new AtomicInteger();
+        private final Options options;
 
-        private BackendPool(List<URI> backends) {
+        private BackendPool(List<URI> backends, Options options) {
             this.backends = backends.stream().map(Backend::new).toList();
+            this.options = options;
         }
 
         int size() {
@@ -283,16 +352,16 @@ public final class LoadBalancer {
         void markPassiveFailure(URI backend) {
             Backend b = find(backend);
             if (b == null) return;
-            b.markUnhealthyFor(PASSIVE_UNHEALTHY_COOLDOWN);
+            b.markUnhealthyFor(options.passiveUnhealthyCooldown);
         }
 
         void runActiveHealthChecks(HttpClient healthClient) {
             for (Backend b : backends) {
-                boolean ok = checkOnce(healthClient, b.base);
+                boolean ok = checkOnce(healthClient, b.base, options.healthTimeout);
                 if (ok) {
                     b.markHealthy();
                 } else {
-                    b.markUnhealthyFor(PASSIVE_UNHEALTHY_COOLDOWN);
+                    b.markUnhealthyFor(options.passiveUnhealthyCooldown);
                 }
             }
         }
@@ -304,11 +373,11 @@ public final class LoadBalancer {
             return null;
         }
 
-        private static boolean checkOnce(HttpClient client, URI backendBase) {
+        private static boolean checkOnce(HttpClient client, URI backendBase, Duration timeout) {
             try {
                 URI healthUri = backendBase.resolve("health");
                 HttpRequest req = HttpRequest.newBuilder(healthUri)
-                        .timeout(HEALTH_TIMEOUT)
+                        .timeout(timeout)
                         .GET()
                         .build();
                 HttpResponse<Void> resp = client.send(req, HttpResponse.BodyHandlers.discarding());

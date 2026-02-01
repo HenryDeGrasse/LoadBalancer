@@ -20,7 +20,7 @@ This milestone is intentionally “too simple” so we can observe early issues:
 
 ### Future milestones (we’ll build next)
 2. **Health checks + passive failure detection** (stop routing to dead upstreams) ✅
-3. **Retries + idempotency rules** (when you can/can’t replay)
+3. **Retries + idempotency rules** (when you can/can’t replay) ✅
 4. **Streaming** (avoid buffering, handle large uploads/downloads)
 5. **Keep-alive + connection pooling + backpressure** (performance under concurrency)
 6. **Least-connections / latency-aware** balancing
