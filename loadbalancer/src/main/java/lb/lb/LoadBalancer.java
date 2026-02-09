@@ -201,21 +201,40 @@ public final class LoadBalancer {
 
         copyRequestHeaders(exchange.getRequestHeaders(), req);
 
-        HttpResponse<byte[]> resp = client.send(req.build(), HttpResponse.BodyHandlers.ofByteArray());
+        // Milestone 4: stream upstream response instead of buffering whole body in memory.
+        HttpResponse<InputStream> resp = client.send(req.build(), HttpResponse.BodyHandlers.ofInputStream());
 
         Headers out = exchange.getResponseHeaders();
         copyResponseHeaders(resp, out);
 
-        byte[] responseBody = resp.body() == null ? new byte[0] : resp.body();
-        exchange.sendResponseHeaders(resp.statusCode(), responseBody.length);
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(responseBody);
+        long contentLength = contentLengthOrChunked(resp);
+        exchange.sendResponseHeaders(resp.statusCode(), contentLength);
+
+        long streamedBytes = 0;
+        try (InputStream upstreamBody = resp.body(); OutputStream downstreamBody = exchange.getResponseBody()) {
+            if (upstreamBody != null && !"HEAD".equalsIgnoreCase(exchange.getRequestMethod())) {
+                streamedBytes = upstreamBody.transferTo(downstreamBody);
+            }
         } finally {
             exchange.close();
         }
 
         System.out.printf("[lb] %s %s -> %s %d (%dB)%n",
-                exchange.getRequestMethod(), exchange.getRequestURI(), backend, resp.statusCode(), responseBody.length);
+                exchange.getRequestMethod(), exchange.getRequestURI(), backend, resp.statusCode(), streamedBytes);
+    }
+
+    private static long contentLengthOrChunked(HttpResponse<?> resp) {
+        return resp.headers()
+                .firstValue("content-length")
+                .map(String::trim)
+                .flatMap(v -> {
+                    try {
+                        return java.util.Optional.of(Long.parseLong(v));
+                    } catch (NumberFormatException ignored) {
+                        return java.util.Optional.empty();
+                    }
+                })
+                .orElse(0L); // 0 means chunked/unknown length for HttpExchange
     }
 
     private static void copyRequestHeaders(Headers in, HttpRequest.Builder out) {
